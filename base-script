@@ -1,0 +1,1541 @@
+#!/usr/bin/env python3
+import sys
+import os
+import random
+import asyncio
+import logging
+import re
+import time
+import traceback
+import sqlite3
+import requests
+import subprocess
+import json
+import threading
+import queue
+import html
+from urllib.parse import urlparse
+from datetime import datetime, timezone
+from math import pow
+from dotenv import load_dotenv
+import psutil
+
+# =============================================================================
+# 📌 Section 1: Dependency Checks & Module Imports
+# =============================================================================
+required_modules = {
+    "torch": "torch",
+    "telethon": "telethon",
+    "dotenv": "python-dotenv",
+    "requests": "requests",
+    "numpy": "numpy",
+    "psutil": "psutil"
+}
+
+def check_required_modules():
+    for mod, pkg in required_modules.items():
+        try:
+            __import__(mod)
+        except ImportError:
+            logging.warning(f"Module {mod} not found. Installing {pkg}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+            __import__(mod)
+            logging.info(f"Module {mod} installed successfully.")
+check_required_modules()
+
+# Telethon imports after dependency checks
+from telethon.tl.types import *
+from telethon import TelegramClient, events, errors
+
+# =============================================================================
+# 📌 Section 2: PyTorch Model Loading (If Available)
+# =============================================================================
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    class SimpleNN(nn.Module):
+        def __init__(self):
+            super(SimpleNN, self).__init__()
+            self.fc1 = nn.Linear(28*28, 128)
+            self.fc2 = nn.Linear(128, 10)
+
+        def forward(self, x):
+            x = x.view(-1, 28*28)
+            x = F.relu(self.fc1(x))
+            return self.fc2(x)
+
+    MODEL = SimpleNN() if os.path.exists("model.pth") else None
+    if MODEL:
+        try:
+            MODEL.load_state_dict(torch.load("model.pth"))
+            MODEL.eval()
+            logging.info("Model loaded successfully")
+        except Exception as e:
+            logging.error(f"Model loading failed: {e}")
+            MODEL = None
+except Exception as e:
+    logging.error(f"PyTorch setup error: {e}")
+    MODEL = None
+
+# =============================================================================
+# 📌 Section 3: Configuration & Environment Setup
+# =============================================================================
+load_dotenv() 
+
+def validate_config(config):
+    if not config['API_HASH'] or len(config['API_HASH']) < 10:
+        logging.error("Invalid API_HASH")
+        return False
+    if config['SOURCE_CHANNEL'] == config['DEST_CHANNEL']:
+        logging.error("Source/Destination channels identical")
+        return False
+    return True
+
+def load_config():
+    config = {}
+    
+    # Try to load from config.json first
+    config_paths = ["config.json", 
+                   os.path.expanduser("~/config.json"),
+                   os.path.dirname(__file__)+"/config.json"]
+    for path in config_paths:
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    config = json.load(f)
+                logging.info(f"Loaded configuration from {path}")
+                break
+            except Exception as e:
+                logging.error(f"Config load error: {e}")
+    
+    # Load integer values
+    for int_key in ['API_ID','SOURCE_CHANNEL','DEST_CHANNEL','START_MESSAGE','END_MESSAGE','ADMIN_CHAT_ID']:
+        env_value = os.getenv(int_key)
+        if env_value:
+            try:
+                config[int_key] = int(env_value)
+                logging.info(f"Loaded {int_key}={config[int_key]} from environment")
+            except ValueError:
+                logging.error(f"Could not convert {int_key}={env_value} to integer")
+                config[int_key] = config.get(int_key) or 0
+        else:
+            config[int_key] = config.get(int_key) or 0
+    
+    # Load string values
+    for str_key in ['API_HASH', 'PHONE_NUMBER', 'BOT_TOKEN', 'CAPTION_URL', 'CUSTOM_CAPTION_PROMO']:
+        env_value = os.getenv(str_key)
+        if env_value:
+            config[str_key] = env_value
+            logging.info(f"Loaded {str_key} from environment")
+        else:
+            config[str_key] = config.get(str_key) or ""
+    
+    # Load boolean values
+    for bool_key in ['USE_ORIGINAL_CAPTIONS', 'USE_FILENAME_AS_CAPTION', 'APPLY_CUSTOM_CAPTION', 
+                     'CLICKABLE_BASE_CAPTION', 'ADD_VIDEO_DURATION']:
+        env_value = os.getenv(bool_key)
+        if env_value:
+            config[bool_key] = env_value.lower() in ("true", "1", "yes", "y")
+            logging.info(f"Loaded {bool_key}={config[bool_key]} from environment")
+        else:
+            config[bool_key] = config.get(bool_key) or False
+            
+            # Set defaults for backward compatibility for the new settings
+            if bool_key == 'CLICKABLE_BASE_CAPTION' and bool_key not in config:
+                config[bool_key] = True
+            if bool_key == 'ADD_VIDEO_DURATION' and bool_key not in config:
+                config[bool_key] = True
+    
+    # Load float values
+    for float_key in ['MIN_MESSAGE_DELAY', 'MAX_MESSAGE_DELAY', 'MIN_BATCH_DELAY', 'MAX_BATCH_DELAY']:
+        env_value = os.getenv(float_key)
+        if env_value:
+            try:
+                config[float_key] = float(env_value)
+                logging.info(f"Loaded {float_key}={config[float_key]} from environment")
+            except ValueError:
+                logging.error(f"Could not convert {float_key}={env_value} to float")
+                # Use defaults if conversion fails
+                if float_key == 'MIN_MESSAGE_DELAY': config[float_key] = 1.0
+                elif float_key == 'MAX_MESSAGE_DELAY': config[float_key] = 2.0
+                elif float_key == 'MIN_BATCH_DELAY': config[float_key] = 2.0
+                elif float_key == 'MAX_BATCH_DELAY': config[float_key] = 10.0
+        else:
+            # Set defaults if not in environment
+            if float_key == 'MIN_MESSAGE_DELAY': config[float_key] = 1.0
+            elif float_key == 'MAX_MESSAGE_DELAY': config[float_key] = 2.0
+            elif float_key == 'MIN_BATCH_DELAY': config[float_key] = 2.0
+            elif float_key == 'MAX_BATCH_DELAY': config[float_key] = 10.0
+
+    # Load additional integer values
+    for add_int_key in ['BATCH_SIZE', 'MAX_RETRIES', 'FLOOD_WAIT_THRESHOLD', 'ALERT_INTERVAL', 
+                        'MAX_FLOOD_WAIT', 'CONCURRENT_LIMIT']:
+        env_value = os.getenv(add_int_key)
+        if env_value:
+            try:
+                config[add_int_key] = int(env_value)
+                logging.info(f"Loaded {add_int_key}={config[add_int_key]} from environment")
+            except ValueError:
+                logging.error(f"Could not convert {add_int_key}={env_value} to integer")
+                # Use defaults if conversion fails
+                if add_int_key == 'BATCH_SIZE': config[add_int_key] = 50
+                elif add_int_key == 'MAX_RETRIES': config[add_int_key] = 5
+                elif add_int_key == 'FLOOD_WAIT_THRESHOLD': config[add_int_key] = 3
+                elif add_int_key == 'ALERT_INTERVAL': config[add_int_key] = 600
+                elif add_int_key == 'MAX_FLOOD_WAIT': config[add_int_key] = 1800
+                elif add_int_key == 'CONCURRENT_LIMIT': config[add_int_key] = 1
+        else:
+            # Set defaults if not in environment
+            if add_int_key == 'BATCH_SIZE': config[add_int_key] = 50
+            elif add_int_key == 'MAX_RETRIES': config[add_int_key] = 5
+            elif add_int_key == 'FLOOD_WAIT_THRESHOLD': config[add_int_key] = 3
+            elif add_int_key == 'ALERT_INTERVAL': config[add_int_key] = 600
+            elif add_int_key == 'MAX_FLOOD_WAIT': config[add_int_key] = 1800
+            elif add_int_key == 'CONCURRENT_LIMIT': config[add_int_key] = 1
+    
+    # Check if using .env only
+    if not any(os.path.exists(p) for p in config_paths):
+        logging.info("Using .env file only for configuration")
+    
+    if not validate_config(config):
+        raise ValueError("Invalid configuration")
+    
+    # Log boolean settings
+    logging.info(f"Caption settings: USE_ORIGINAL_CAPTIONS={config.get('USE_ORIGINAL_CAPTIONS', False)}, " 
+                 f"USE_FILENAME_AS_CAPTION={config.get('USE_FILENAME_AS_CAPTION', False)}, "
+                 f"APPLY_CUSTOM_CAPTION={config.get('APPLY_CUSTOM_CAPTION', False)}, "
+                 f"CLICKABLE_BASE_CAPTION={config.get('CLICKABLE_BASE_CAPTION', True)}, "
+                 f"ADD_VIDEO_DURATION={config.get('ADD_VIDEO_DURATION', True)}")
+    
+    return config
+
+config = load_config()
+
+# Ensure boolean values are correctly set
+logging.info("Raw config caption settings:")
+logging.info(f"USE_ORIGINAL_CAPTIONS = {config.get('USE_ORIGINAL_CAPTIONS')}, type: {type(config.get('USE_ORIGINAL_CAPTIONS'))}")
+logging.info(f"USE_FILENAME_AS_CAPTION = {config.get('USE_FILENAME_AS_CAPTION')}, type: {type(config.get('USE_FILENAME_AS_CAPTION'))}")
+logging.info(f"APPLY_CUSTOM_CAPTION = {config.get('APPLY_CUSTOM_CAPTION')}, type: {type(config.get('APPLY_CUSTOM_CAPTION'))}")
+logging.info(f"CLICKABLE_BASE_CAPTION = {config.get('CLICKABLE_BASE_CAPTION')}, type: {type(config.get('CLICKABLE_BASE_CAPTION'))}")
+logging.info(f"ADD_VIDEO_DURATION = {config.get('ADD_VIDEO_DURATION')}, type: {type(config.get('ADD_VIDEO_DURATION'))}")
+
+# Extract configuration variables for global use
+API_ID = config['API_ID']
+API_HASH = config['API_HASH']
+PHONE_NUMBER = config['PHONE_NUMBER']
+BOT_TOKEN = config['BOT_TOKEN']
+SOURCE_CHANNEL = config['SOURCE_CHANNEL']
+DEST_CHANNEL = config['DEST_CHANNEL']
+START_MESSAGE = config['START_MESSAGE']
+END_MESSAGE = config['END_MESSAGE']
+ADMIN_CHAT_ID = config['ADMIN_CHAT_ID']
+
+# =============================================================================
+# 📌 Section 4: Runtime Settings, Rate Limiting & Concurrency
+# =============================================================================
+
+# Update these global variables from config
+MIN_MESSAGE_DELAY = config.get('MIN_MESSAGE_DELAY', 1.0)
+MAX_MESSAGE_DELAY = config.get('MAX_MESSAGE_DELAY', 2.0)
+MIN_BATCH_DELAY = config.get('MIN_BATCH_DELAY', 2.0)
+MAX_BATCH_DELAY = config.get('MAX_BATCH_DELAY', 10.0)
+BATCH_SIZE = config.get('BATCH_SIZE', 50)
+MAX_RETRIES = config.get('MAX_RETRIES', 5)
+FLOOD_WAIT_THRESHOLD = config.get('FLOOD_WAIT_THRESHOLD', 3)
+ALERT_INTERVAL = config.get('ALERT_INTERVAL', 600)
+MAX_FLOOD_WAIT = config.get('MAX_FLOOD_WAIT', 1800)
+CONCURRENT_LIMIT = config.get('CONCURRENT_LIMIT', 1)
+
+BOT_PAUSED = False
+FLOOD_WAIT_COUNT = 0
+MESSAGE_SUCCESS_COUNT = 0
+LAST_ALERT_TIME = 0
+
+FAILED_MESSAGES = []   # Each entry: (msg_id, original_msg)
+SKIPPED_MESSAGES = []  # Each entry: (msg_id, reason)
+
+STOP_EVENT = asyncio.Event()
+retry_queue = asyncio.Queue()
+
+# =============================================================================
+# 📌 Section 5: Logging Configuration
+# =============================================================================
+
+from logging.handlers import RotatingFileHandler
+handler = RotatingFileHandler("bot_activity.log", maxBytes=10_000_000, backupCount=5)
+logging.basicConfig(
+    handlers=[handler],
+    level=logging.INFO,
+    format='{"timestamp": "%(asctime)s", "level": "%(levelname)s", "message": "%(message)s"}',
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', "%Y-%m-%d %H:%M:%S")
+console.setFormatter(formatter)
+logging.getLogger('').addHandler(console)
+
+# =============================================================================
+# 📌 Section 6: SQLite Database Setup for Message Tracking & Retry Queue
+# =============================================================================
+
+DB_FILE = os.path.join(os.path.expanduser("~"), "forwarded_messages.db")
+
+class DatabasePool:
+    def __init__(self, db_file, max_connections=5):
+        self.db_file = db_file
+        self.max_connections = max_connections
+        self._pool = queue.Queue(maxsize=max_connections)
+        self._active = 0
+        self._lock = threading.Lock()
+        
+        # Initialize the pool
+        for _ in range(max_connections):
+            self._pool.put(self._create_connection())
+    
+    def _create_connection(self):
+        conn = sqlite3.connect(self.db_file, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    def get_connection(self):
+        try:
+            return self._pool.get(block=False)
+        except queue.Empty:
+            with self._lock:
+                if self._active < self.max_connections:
+                    self._active += 1
+                    return self._create_connection()
+                else:
+                    return self._pool.get(block=True)
+    
+    def release_connection(self, conn):
+        try:
+            self._pool.put(conn, block=False)
+        except queue.Full:
+            conn.close()
+            with self._lock:
+                self._active -= 1
+    
+    def close_all(self):
+        while not self._pool.empty():
+            conn = self._pool.get()
+            conn.close()
+            with self._lock:
+                self._active -= 1
+
+# Initialize the connection pool
+db_pool = DatabasePool(DB_FILE, max_connections=5)
+
+class DatabaseConnection:
+    def __init__(self, pool):
+        self.pool = pool
+        self.conn = None
+    
+    def __enter__(self):
+        self.conn = self.pool.get_connection()
+        return self.conn
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            if exc_type is not None:
+                self.conn.rollback()
+            else:
+                self.conn.commit()
+            self.pool.release_connection(self.conn)
+
+class Database:
+    def __init__(self, db_file):
+        self.conn = sqlite3.connect(db_file, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self.cursor.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, forwarded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        self.cursor.execute("CREATE TABLE IF NOT EXISTS retry_queue (msg_id INTEGER PRIMARY KEY, attempt INTEGER)")
+        self.conn.commit()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, tb):
+        self.conn.close()
+
+    def is_message_forwarded_sync(self, msg_id):
+        self.cursor.execute("SELECT id FROM messages WHERE id = ?", (msg_id,))
+        return self.cursor.fetchone() is not None
+
+    def mark_message_forwarded_sync(self, msg_id):
+        self.cursor.execute("INSERT OR IGNORE INTO messages (id) VALUES (?)", (msg_id,))
+        self.conn.commit()
+
+    def get_last_forwarded_message_sync(self):
+        self.cursor.execute("SELECT MAX(id) FROM messages")
+        row = self.cursor.fetchone()
+        return row[0] if row and row[0] is not None else START_MESSAGE - 1
+
+    def add_retry_sync(self, msg_id, attempt):
+        self.cursor.execute("INSERT OR REPLACE INTO retry_queue (msg_id, attempt) VALUES (?, ?)", (msg_id, attempt))
+        self.conn.commit()
+
+    def remove_retry_sync(self, msg_id):
+        self.cursor.execute("DELETE FROM retry_queue WHERE msg_id = ?", (msg_id,))
+        self.conn.commit()
+
+    def get_all_retries_sync(self):
+        self.cursor.execute("SELECT msg_id, attempt FROM retry_queue")
+        return self.cursor.fetchall()
+
+def setup_database():
+    """Initialize database tables if they don't exist"""
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY,
+                forwarded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS retry_queue (
+                msg_id INTEGER PRIMARY KEY,
+                attempt INTEGER
+            )
+        """)
+        conn.commit()
+
+async def is_message_forwarded(msg_id):
+    def _check():
+        with DatabaseConnection(db_pool) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM messages WHERE id = ?", (msg_id,))
+            return cursor.fetchone() is not None
+    return await asyncio.to_thread(_check)
+
+async def mark_message_forwarded(msg_id):
+    def _mark():
+        with DatabaseConnection(db_pool) as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT OR IGNORE INTO messages (id) VALUES (?)", (msg_id,))
+    await asyncio.to_thread(_mark)
+
+async def get_last_forwarded_message():
+    with Database(DB_FILE) as db:
+        return await asyncio.to_thread(db.get_last_forwarded_message_sync)
+
+async def persist_retry(msg_id, attempt):
+    with Database(DB_FILE) as db:
+        await asyncio.to_thread(db.add_retry_sync, msg_id, attempt)
+
+async def remove_persisted_retry(msg_id):
+    with Database(DB_FILE) as db:
+        await asyncio.to_thread(db.remove_retry_sync, msg_id)
+
+async def load_persisted_retries():
+    with Database(DB_FILE) as db:
+        return await asyncio.to_thread(db.get_all_retries_sync)
+
+# =============================================================================
+# 📌 Section 7: Utility Functions for Text & Content Filtering
+# =============================================================================
+
+def clean_message_text(text):
+    return "" if not text else re.sub(r"\s+", " ", text).strip()
+
+FILTER_KEYWORDS = ["spam", "ads"]
+
+def should_forward_message(msg):
+    text = msg.message if msg.message is not None else ""
+    return not any(word in text.lower() for word in FILTER_KEYWORDS)
+
+def get_message_priority(msg):
+    # Placeholder for message priority logic; default priority is 0
+    return 0
+
+# =============================================================================
+# 📌 Section 8: Dynamic Delay Functions
+# =============================================================================
+
+# Initialize global variable for tracking API load
+api_load_normal = True  # Assume normal load initially
+
+def get_dynamic_message_delay():
+    if api_load_normal:
+        return round(random.uniform(1.1, 1.5), 2)
+    else:
+        return round(random.uniform(1.5, 2.0), 2)
+
+def get_dynamic_batch_delay():
+    if api_load_normal:
+        return round(random.uniform(2.0, 3.5), 2)
+    else:
+        return round(random.uniform(8.5, 10.0), 2)
+
+def get_dynamic_batch_size():
+    if api_load_normal:
+        return random.randint(70, 90)
+    else:
+        return random.randint(20, 30)
+
+# Set initial global message delay
+MESSAGE_DELAY = get_dynamic_message_delay()
+
+# =============================================================================
+# 📌 Section 9: Message Processing with Dynamic Delays
+# =============================================================================
+
+async def forward_message(client, message, dest_channel):
+    global api_load_normal
+    try:
+        await client.forward_messages(dest_channel, message)
+        return True
+    except errors.FloodWaitError as e:
+        logging.warning(f"Flood wait: {e.seconds} seconds")
+        await asyncio.sleep(e.seconds + 1)
+        api_load_normal = False
+        return False
+    except Exception as e:
+        logging.error(f"Failed to forward message: {repr(e)}")
+        api_load_normal = False
+        return False
+
+async def process_batch(messages, client):
+    global api_load_normal, MESSAGE_DELAY, BATCH_SIZE
+    # Use global BATCH_SIZE instead of get_dynamic_batch_size() to honor dynamic adjustments
+    current_batch_size = min(len(messages), BATCH_SIZE)
+    for i in range(current_batch_size):
+        await forward_message(client, messages[i], DEST_CHANNEL)
+        # Use the global MESSAGE_DELAY instead of calling get_dynamic_message_delay() again
+        await asyncio.sleep(MESSAGE_DELAY)
+    batch_delay = get_dynamic_batch_delay()
+    await asyncio.sleep(batch_delay)
+
+# =============================================================================
+# 📌 Section 10: Alert & Notification System
+# =============================================================================
+
+async def send_alert(message, client=None):
+    global LAST_ALERT_TIME
+    if time.time() - LAST_ALERT_TIME < ALERT_INTERVAL:
+        return
+    LAST_ALERT_TIME = time.time()
+    try:
+        # Use the provided client or fallback to bot_client if it exists in globals
+        if client:
+            await client.send_message(ADMIN_CHAT_ID, message[:4096])
+        elif 'bot_client' in globals():
+            await bot_client.send_message(ADMIN_CHAT_ID, message[:4096])
+        else:
+            logging.warning("No client available to send alert")
+    except Exception as e:
+        logging.error(f"Failed to send alert: {repr(e)}")
+    print(f"ALERT: {message}")
+
+# =============================================================================
+# 📌 Section 11: Media Caption & Formatting Utilities
+# =============================================================================
+
+def is_valid_url(url, check_reachability=False):
+    if not isinstance(url, str) or not url.strip():
+        return False
+    try:
+        result = urlparse(url)
+        valid_format = result.scheme in ("http", "https") and result.netloc and "." in result.netloc
+        if valid_format and check_reachability:
+            try:
+                response = requests.head(url, timeout=3)
+                return response.status_code < 400
+            except requests.RequestException as e:
+                logging.warning(f"URL reachability check failed: {url} - Error: {e}")
+                return False
+        return valid_format
+    except Exception as e:
+        logging.warning(f"Invalid URL detected: {url} - Error: {e}")
+        return False
+
+def format_caption(filename=None, duration=None, original_caption=None):
+    # Add detailed logging
+    logging.info(f"Caption input - Filename: '{filename}', Original caption: '{original_caption}'")
+    logging.info(f"Config values - USE_ORIGINAL_CAPTIONS: {config.get('USE_ORIGINAL_CAPTIONS')}, " + 
+                 f"USE_FILENAME_AS_CAPTION: {config.get('USE_FILENAME_AS_CAPTION')}, " +
+                 f"APPLY_CUSTOM_CAPTION: {config.get('APPLY_CUSTOM_CAPTION')}, " +
+                 f"CLICKABLE_BASE_CAPTION: {config.get('CLICKABLE_BASE_CAPTION')}, " +
+                 f"ADD_VIDEO_DURATION: {config.get('ADD_VIDEO_DURATION')}")
+    
+    caption_url = str(config.get("CAPTION_URL", "https://linktr.ee/CoursesHubIndia")).strip()
+    if not is_valid_url(caption_url):
+        logging.warning("Invalid CAPTION_URL in config, using default.")
+        caption_url = "https://linktr.ee/CoursesHubIndia"
+
+    custom_promo = str(config.get("CUSTOM_CAPTION_PROMO", "")).strip()
+    safe_original = html.escape(str(original_caption)) if original_caption else ""
+    safe_filename = html.escape(str(filename)) if filename else ""
+    
+    logging.info(f"Processed values - safe_original: '{safe_original}', safe_filename: '{safe_filename}'")
+    
+    # Process boolean settings
+    use_original = config.get("USE_ORIGINAL_CAPTIONS", False)
+    use_filename = config.get("USE_FILENAME_AS_CAPTION", False)
+    apply_custom = config.get("APPLY_CUSTOM_CAPTION", False)
+    clickable_caption = config.get("CLICKABLE_BASE_CAPTION", True)  # Default to true for backward compatibility
+    add_duration = config.get("ADD_VIDEO_DURATION", True)  # Default to true for backward compatibility
+    
+    if isinstance(use_original, str):
+        use_original = use_original.lower() in ("true", "1", "yes", "y")
+    if isinstance(use_filename, str):
+        use_filename = use_filename.lower() in ("true", "1", "yes", "y")
+    if isinstance(apply_custom, str):
+        apply_custom = apply_custom.lower() in ("true", "1", "yes", "y")
+    if isinstance(clickable_caption, str):
+        clickable_caption = clickable_caption.lower() in ("true", "1", "yes", "y")
+    if isinstance(add_duration, str):
+        add_duration = add_duration.lower() in ("true", "1", "yes", "y")
+    
+    logging.info(f"Boolean flags - use_original: {use_original}, use_filename: {use_filename}, " +
+                 f"apply_custom: {apply_custom}, clickable_caption: {clickable_caption}, " +
+                 f"add_duration: {add_duration}")
+    
+    # Determine base caption with proper priority
+    # Create a combined caption if multiple options are enabled
+    parts = []
+    
+    if use_original and safe_original:
+        parts.append(safe_original)
+        logging.info("Added original caption to parts")
+        
+    if use_filename and safe_filename:
+        parts.append(safe_filename)
+        logging.info("Added filename to parts")
+    
+    # If both options are enabled but no content available, or if no options enabled
+    if not parts:
+        parts.append("Media File")
+        logging.info("No valid parts found, using 'Media File'")
+    
+    # Join all parts with a separator
+    base_caption = " | ".join(parts)
+    logging.info(f"Final base_caption: '{base_caption}'")
+    
+    # Format the final caption with conditional clickable link
+    if clickable_caption:
+        caption = f"📌 <b><a href='{html.escape(caption_url)}'>{base_caption}</a></b>"
+    else:
+        caption = f"📌 <b>{base_caption}</b>"
+
+    # Conditionally add duration based on setting
+    if add_duration and duration is not None:
+        try:
+            duration = float(duration)
+            if duration < 0:
+                logging.warning(f"Negative duration detected: {duration}")
+                duration = 0
+            duration = int(duration)
+            hours, rem = divmod(duration, 3600)
+            mins, secs = divmod(rem, 60)
+            caption += f"\n\n🎬 Duration: {hours:02}:{mins:02}:{secs:02}"
+        except (ValueError, TypeError) as e:
+            logging.warning(f"Invalid duration value: {duration} - Error: {e}")
+
+    if apply_custom and custom_promo:
+        caption += f"\n\n{custom_promo}"
+        logging.info("Added custom promo text")
+
+    logging.info(f"Final caption: '{caption}'")
+    return caption
+
+# =============================================================================
+# 📌 Section 12: Flood Wait Handling & Adaptive Backoff
+# =============================================================================
+
+class PIDController:
+    def __init__(self, Kp, Ki, Kd, set_point, output_limits=(None, None)):
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+        self.set_point = set_point
+        self.integral = 0.0
+        self.previous_error = None
+        self.output_limits = output_limits
+
+    def update(self, measurement, dt=1.0):
+        error = measurement - self.set_point
+        self.integral += error * dt
+        derivative = 0.0 if self.previous_error is None else (error - self.previous_error) / dt
+        self.previous_error = error
+        output = self.Kp * error + self.Ki * self.integral + self.Kd * derivative
+        if self.output_limits[0] is not None:
+            output = max(self.output_limits[0], output)
+        if self.output_limits[1] is not None:
+            output = min(self.output_limits[1], output)
+        return output
+
+class AdaptiveBackoff:
+    def __init__(self, initial_delay=1.0, max_delay=MAX_FLOOD_WAIT, factor=1.5, jitter=0.1):
+        self.initial_delay = initial_delay
+        self.max_delay = max_delay
+        self.factor = factor
+        self.jitter = jitter
+        self.attempt = 0
+        self.base_delay = initial_delay
+        
+    def reset(self):
+        self.attempt = 0
+        self.base_delay = self.initial_delay
+        
+    def next_backoff(self):
+        if self.attempt == 0:
+            self.attempt = 1
+            return self.initial_delay
+        self.attempt += 1
+        delay = min(self.max_delay, self.base_delay * (self.factor ** (self.attempt - 1)))
+        jitter_amount = self.jitter * delay
+        self.base_delay = delay
+        return delay + random.uniform(-jitter_amount, jitter_amount)
+
+pid_controller = PIDController(Kp=0.1, Ki=0.015, Kd=0.07, set_point=2.0, output_limits=(-0.2, 0.2))
+backoff_manager = AdaptiveBackoff(initial_delay=1.0, max_delay=MAX_FLOOD_WAIT)
+
+async def handle_flood_wait(seconds):
+    global FLOOD_WAIT_COUNT, MESSAGE_DELAY
+    FLOOD_WAIT_COUNT += 1
+    backoff = max(seconds, backoff_manager.next_backoff())
+    logging.warning(f"FloodWait triggered: waiting for {backoff:.2f} seconds (reported {seconds}s)")
+    await asyncio.sleep(backoff)
+    if FLOOD_WAIT_COUNT >= 3:
+        adjustment = pid_controller.update(seconds, dt=1.0)
+        MESSAGE_DELAY = min(5.0, max(1.0, MESSAGE_DELAY + adjustment))
+        logging.info(f"Adjusted MESSAGE_DELAY to {MESSAGE_DELAY} after flood wait")
+    if FLOOD_WAIT_COUNT >= FLOOD_WAIT_THRESHOLD:
+        await send_alert(f"🚨 Critical flood wait detected! Adjusting delay to {MESSAGE_DELAY}s")
+        if FLOOD_WAIT_COUNT > FLOOD_WAIT_THRESHOLD * 2:
+            FLOOD_WAIT_COUNT = FLOOD_WAIT_THRESHOLD
+
+# =============================================================================
+# 📌 Section 13: Dynamic Batch Size Adjustment Strategies
+# =============================================================================
+
+def rl_adjuster(metrics):
+    return max(10, BATCH_SIZE - 10) if metrics["error_count"] > 5 else BATCH_SIZE
+
+def mab_adjuster(metrics):
+    arms = [20, 30, 40, 50, 60]
+    return min(arms) if metrics["error_count"] > 5 else max(arms)
+
+def fuzzy_adjuster(metrics):
+    return int(BATCH_SIZE * 0.8) if metrics["avg_processing_time"] > 5 else int(BATCH_SIZE * 1.1)
+
+def dynamic_batch_size_adjuster():
+    global BATCH_SIZE
+    metrics = {
+        "error_count": len(FAILED_MESSAGES),
+        "avg_processing_time": MESSAGE_DELAY,
+        "success_count": MESSAGE_SUCCESS_COUNT
+    }
+    rl_val = rl_adjuster(metrics)
+    mab_val = mab_adjuster(metrics)
+    fuzzy_val = fuzzy_adjuster(metrics)
+    new_batch_size = int((rl_val + mab_val + fuzzy_val) / 3)
+    new_batch_size = max(10, min(100, new_batch_size))
+    logging.info(f"Adjusted batch size from {BATCH_SIZE} to {new_batch_size} based on metrics {metrics}")
+    BATCH_SIZE = new_batch_size
+
+# =============================================================================
+# 📌 Section 14: Telegram Client Initialization
+# =============================================================================
+
+user_client = TelegramClient("user_session", API_ID, API_HASH)
+bot_client = TelegramClient("bot_session", API_ID, API_HASH)
+
+# =============================================================================
+# 📌 Section 15: Admin Command Handler for Bot Control
+# =============================================================================
+
+@bot_client.on(events.NewMessage)
+async def handle_admin_commands(event):
+    if event.sender_id != ADMIN_CHAT_ID and event.chat_id != ADMIN_CHAT_ID:
+        return
+    cmd = event.raw_text.lower().strip()
+    global BOT_PAUSED, FILTER_KEYWORDS, MESSAGE_DELAY, BATCH_SIZE
+    if cmd == "/pause":
+        BOT_PAUSED = True
+        await event.reply("⏸ Bot paused")
+        print("Admin Command: Bot paused")
+    elif cmd == "/resume":
+        BOT_PAUSED = False
+        await event.reply("▶ Bot resumed")
+        print("Admin Command: Bot resumed")
+    elif cmd.startswith("/add_filter "):
+        keyword = cmd.split(" ", 1)[1].strip()
+        if not keyword:
+            await event.reply("⚠ Please provide a keyword to add")
+            return
+        if keyword.lower() in FILTER_KEYWORDS:
+            await event.reply(f"⚠ Keyword '{keyword}' already exists")
+        else:
+            FILTER_KEYWORDS.append(keyword.lower())
+            await event.reply(f"✅ Added filter: {keyword}")
+            print(f"Admin Command: Added filter '{keyword}'")
+    elif cmd.startswith("/remove_filter "):
+        keyword = cmd.split(" ", 1)[1].strip()
+        if keyword.lower() in FILTER_KEYWORDS:
+            FILTER_KEYWORDS.remove(keyword.lower())
+            await event.reply(f"❌ Removed filter: {keyword}")
+            print(f"Admin Command: Removed filter '{keyword}'")
+        else:
+            await event.reply(f"⚠ Keyword '{keyword}' not found")
+    elif cmd == "/list_filters":
+        filters = "\n".join(FILTER_KEYWORDS) or "No active filters"
+        await event.reply(f"🔍 Current filters:\n{filters}")
+    elif cmd == "/status":
+        status = "PAUSED ⏸" if BOT_PAUSED else "ACTIVE ▶"
+        await event.reply(
+            f"🤖 Bot Status: {status}\n"
+            f"📨 Forwarded Messages: {MESSAGE_SUCCESS_COUNT}\n"
+            f"🔍 Skipped Messages: {len(SKIPPED_MESSAGES)}\n"
+            f"❌ Failed Messages: {len(FAILED_MESSAGES)}\n"
+            f"🔍 Active Filters: {len(FILTER_KEYWORDS)}"
+        )
+    elif cmd.startswith("/set_delay "):
+        try:
+            new_delay = float(cmd.split(" ", 1)[1].strip())
+            if new_delay < 0.5:
+                await event.reply("⚠ Delay must be at least 0.5 seconds")
+                return
+            MESSAGE_DELAY = new_delay
+            await event.reply(f"⏱ Message delay set to {MESSAGE_DELAY}s")
+            print(f"Admin Command: Set delay to {MESSAGE_DELAY}s")
+        except ValueError:
+            await event.reply("⚠ Please provide a valid number for delay")
+    elif cmd.startswith("/set_batch_size "):
+        try:
+            new_batch_size = int(cmd.split(" ", 1)[1].strip())
+            if new_batch_size < 1:
+                await event.reply("⚠ Batch size must be at least 1")
+                return
+            BATCH_SIZE = new_batch_size
+            await event.reply(f"📊 Batch size set to {BATCH_SIZE}")
+            print(f"Admin Command: Set batch size to {BATCH_SIZE}")
+        except ValueError:
+            await event.reply("⚠ Please provide a valid number for batch size")
+    elif cmd in ["/stop", "/close", "/end"]:
+        await event.reply("🔴 Shutting down the bot as per admin command.")
+        report = (
+            f"✅ Final Report:\n"
+            f"Forwarded Messages: {MESSAGE_SUCCESS_COUNT}\n"
+            f"Skipped Messages: {len(SKIPPED_MESSAGES)}\n"
+            f"Failed Messages: {len(FAILED_MESSAGES)}\n"
+            f"Skipped Details: {SKIPPED_MESSAGES}"
+        )
+        await bot_client.send_message(ADMIN_CHAT_ID, report, parse_mode="html")
+        print("Admin Command: Shutting down the bot. Final Report sent.")
+        STOP_EVENT.set()
+    else:
+        await event.reply(
+            "❌ Unknown command. Available commands:\n"
+            "/pause /resume /add_filter <word> "
+            "/remove_filter <word> /list_filters /status /set_delay <number> /set_batch_size <number> /stop /close /end"
+        )
+
+# =============================================================================
+# 📌 Section 16: Message Forwarding, Error Handling & Retry Strategies
+# =============================================================================
+
+def predict_failure_reason(msg):
+    text = msg.message if msg.message is not None else ""
+    if "timeout" in text.lower():
+        return "transient"
+    return "permanent"
+
+def bayesian_retry_probability(msg):
+    return random.uniform(0, 1)
+
+async def attempt_forward_message(msg, attempt=1, reattempt=False):
+    global MESSAGE_SUCCESS_COUNT, MESSAGE_DELAY
+    msg_type = "unknown"
+    if msg.media:
+        if isinstance(msg.media, MessageMediaDocument):
+            for attr in msg.media.document.attributes:
+                if isinstance(attr, DocumentAttributeVideo):
+                    msg_type = "video"
+                    break
+            if msg_type == "unknown":
+                msg_type = "document"
+        elif isinstance(msg.media, MessageMediaPhoto):
+            msg_type = "photo"
+    else:
+        msg_type = "text"
+    
+    logging.info(f"Forwarding {msg_type} message {msg.id} (attempt {attempt}) at {datetime.now(timezone.utc).isoformat()}")
+
+    if BOT_PAUSED:
+        SKIPPED_MESSAGES.append((msg.id, "Bot paused"))
+        print(f"Message {msg.id} skipped (Bot paused)")
+        return False
+    if not should_forward_message(msg):
+        SKIPPED_MESSAGES.append((msg.id, "Filtered content"))
+        print(f"Message {msg.id} skipped (Filtered content)")
+        return False
+    if await is_message_forwarded(msg.id):
+        SKIPPED_MESSAGES.append((msg.id, "Already forwarded"))
+        print(f"Message {msg.id} skipped (Already forwarded)")
+        return False
+
+    caption = ""
+    error_category = "none"
+    
+    if msg.media:
+        if isinstance(msg.media, MessageMediaDocument):
+            duration = None
+            filename = "File"
+            for attr in msg.media.document.attributes:
+                logging.info(f"Attribute type: {type(attr).__name__}")
+                if isinstance(attr, DocumentAttributeVideo):
+                    duration = attr.duration
+                    logging.info(f"Found video attribute with duration: {duration}")
+                elif isinstance(attr, DocumentAttributeAudio):
+                    logging.info(f"Found audio attribute")
+                    if hasattr(attr, "file_name") and attr.file_name:
+                        filename = attr.file_name
+                        logging.info(f"Got filename from audio attribute: {filename}")
+                elif isinstance(attr, DocumentAttributeFilename):
+                    filename = attr.file_name
+                    logging.info(f"Got filename from filename attribute: {filename}")
+                elif hasattr(attr, 'file_name') and attr.file_name:
+                    filename = attr.file_name
+                    logging.info(f"Got filename from generic attribute: {filename}")
+            
+            # After the loop, log the extracted data
+            logging.info(f"Document message {msg.id} - Extracted filename: '{filename}', Message text: '{msg.message}'")
+            
+            caption = format_caption(filename, duration, msg.message)
+        elif isinstance(msg.media, MessageMediaPhoto):
+            caption = format_caption("", None, msg.message)
+        elif isinstance(msg.media, (MessageMediaPoll, MessageMediaGeo)):
+            details = f"Media details: {msg.media.__class__.__name__} (not fully supported)"
+            caption = f"{msg.message}\n\n{details}"
+        elif isinstance(msg.media, MessageMediaUnsupported):
+            try:
+                placeholder = f"Message {msg.id} skipped due to unsupported media! Contact @mylearninglistbot"
+                await user_client.send_message(DEST_CHANNEL, placeholder, parse_mode="html")
+            except Exception as e_placeholder:
+                logging.error(f"Failed to send placeholder for msg {msg.id} (Unsupported media): {repr(e_placeholder)}")
+            SKIPPED_MESSAGES.append((msg.id, "Unsupported media"))
+            print(f"Message {msg.id} skipped (Unsupported media)")
+            return False
+        else:
+            try:
+                placeholder = f"Message {msg.id} skipped due to unsupported media type! Contact @mylearninglistbot"
+                await user_client.send_message(DEST_CHANNEL, placeholder, parse_mode="html")
+            except Exception as e_placeholder:
+                logging.error(f"Failed to send placeholder for msg {msg.id} (Unsupported media type): {repr(e_placeholder)}")
+            SKIPPED_MESSAGES.append((msg.id, "Unsupported media type"))
+            print(f"Message {msg.id} skipped (Unsupported media type)")
+            return False
+
+    try:
+        if msg.media:
+            await user_client.send_file(
+                DEST_CHANNEL,
+                msg.media,
+                caption=caption,
+                parse_mode="html"
+            )
+        elif msg.message:
+            cleaned_text = re.sub(r'[\*\{\}\<\>_]', '', msg.message)
+            bold_text = f"<b>{cleaned_text}</b>"
+            await user_client.send_message(
+                DEST_CHANNEL,
+                bold_text,
+                parse_mode="html"
+            )
+    except errors.FloodWaitError as e:
+        error_category = "rate_limit"
+        await handle_flood_wait(e.seconds)
+        if attempt < MAX_RETRIES:
+            if not reattempt:
+                await persist_retry(msg.id, attempt + 1)
+                await retry_queue.put((msg, attempt + 1))
+                logging.info(f"Scheduled retry for message {msg.id} (FloodWait, attempt {attempt+1})")
+        else:
+            if not reattempt:
+                placeholder = f"Message {msg.id} skipped after max retries (FloodWait)! Contact @mylearninglistbot"
+                try:
+                    await user_client.send_message(DEST_CHANNEL, placeholder, parse_mode="html")
+                    FAILED_MESSAGES.append((msg.id, msg))
+                    print(f"Message {msg.id} failed after max retries. Placeholder sent.")
+                except Exception as e_placeholder:
+                    logging.error(f"Failed to send placeholder for msg {msg.id}: {repr(e_placeholder)}")
+            else:
+                print(f"Message {msg.id} extra reattempt failed (FloodWait, max retries reached).")
+        return False
+    except errors.MediaCaptionTooLongError:
+        error_category = "content_limitation"
+        logging.error(f"Caption too long for message {msg.id}")
+        if len(caption) > 1024:
+            truncated_caption = caption[:1020] + "..."
+            try:
+                await user_client.send_file(
+                    DEST_CHANNEL,
+                    msg.media,
+                    caption=truncated_caption,
+                    parse_mode="html"
+                )
+                await mark_message_forwarded(msg.id)
+                await remove_persisted_retry(msg.id)
+                MESSAGE_SUCCESS_COUNT += 1
+                logging.info(f"✅ Forwarded message {msg.id} with truncated caption")
+                return True
+            except Exception as e_truncated:
+                logging.error(f"Failed to send with truncated caption: {repr(e_truncated)}")
+        return False
+    except (requests.Timeout, asyncio.TimeoutError) as e:
+        error_category = "timeout"
+        logging.error(f"Timeout error for message {msg.id}: {repr(e)}")
+        await asyncio.sleep(5)
+        if attempt < MAX_RETRIES:
+            retry_delay = min(30, 2 ** attempt)
+            if not reattempt:
+                await persist_retry(msg.id, attempt + 1)
+                await retry_queue.put((msg, attempt + 1))
+                logging.info(f"Scheduled retry for message {msg.id} in {retry_delay}s (timeout, attempt {attempt+1})")
+        else:
+            if not reattempt:
+                placeholder = f"Message {msg.id} skipped after timeout (max retries)! Contact @mylearninglistbot"
+                try:
+                    await user_client.send_message(DEST_CHANNEL, placeholder, parse_mode="html")
+                    FAILED_MESSAGES.append((msg.id, msg))
+                    print(f"Message {msg.id} failed after timeout max retries. Placeholder sent.")
+                except Exception as e_placeholder:
+                    logging.error(f"Failed to send placeholder for msg {msg.id}: {repr(e_placeholder)}")
+            else:
+                print(f"Message {msg.id} extra reattempt failed (Timeout, max retries reached).")
+        return False
+    except Exception as e:
+        error_class = e.__class__.__name__
+        if any(term in str(e).lower() for term in ["connect", "network", "timeout"]):
+            error_category = "network"
+        elif any(term in str(e).lower() for term in ["permission", "unauthorized", "forbidden"]):
+            error_category = "permission"
+        else:
+            error_category = "unknown"
+        
+        logging.error(f"Forward error for msg {msg.id}: {error_class}/{error_category}: {repr(e)}\n{traceback.format_exc()}")
+        failure_reason = predict_failure_reason(msg)
+        probability = bayesian_retry_probability(msg)
+        
+        if error_category in ["network", "timeout", "rate_limit"] and attempt < MAX_RETRIES:
+            retry_delay = min(30, 2 ** attempt)
+            await persist_retry(msg.id, attempt + 1)
+            await retry_queue.put((msg, attempt + 1))
+            logging.info(f"Scheduled retry for message {msg.id} in {retry_delay}s (error: {error_category}, attempt {attempt+1})")
+            await asyncio.sleep(retry_delay)
+        elif attempt < MAX_RETRIES and probability > 0.5 and failure_reason == "transient":
+            await persist_retry(msg.id, attempt + 1)
+            await retry_queue.put((msg, attempt + 1))
+            logging.info(f"Retrying message {msg.id}, attempt {attempt + 1}, reason: {failure_reason} ({probability:.2f})")
+        else:
+            if not reattempt:
+                placeholder = f"Message {msg.id} skipped after error (max retries)! Contact @mylearninglistbot"
+                try:
+                    await user_client.send_message(DEST_CHANNEL, placeholder, parse_mode="html")
+                    FAILED_MESSAGES.append((msg.id, msg))
+                    print(f"Message {msg.id} failed after error max retries. Placeholder sent.")
+                except Exception as e_placeholder:
+                    logging.error(f"Failed to send placeholder for msg {msg.id}: {repr(e_placeholder)}")
+            else:
+                print(f"Message {msg.id} extra reattempt failed (Error, max retries reached).")
+        return False
+    else:
+        try:
+            await mark_message_forwarded(msg.id)
+            await remove_persisted_retry(msg.id)
+        except Exception as mark_error:
+            logging.error(f"Failed to mark message {msg.id} as forwarded: {repr(mark_error)}")
+        MESSAGE_SUCCESS_COUNT += 1
+        if MESSAGE_SUCCESS_COUNT % 10 == 0:
+            MESSAGE_DELAY = max(1.0, MESSAGE_DELAY * 0.85)
+        logging.info(f"✅ Forwarded message {msg.id}")
+        print(f"✅ Message {msg.id} forwarded successfully")
+        return True
+
+# =============================================================================
+# 📌 Section 17: Persistent Retry Queue Processor
+# =============================================================================
+
+async def process_retry_queue():
+    persisted = await load_persisted_retries()
+    logging.info(f"Loading {len(persisted)} persisted retries from database")
+    
+    for msg_id, attempt in persisted:
+        try:
+            msg = await user_client.get_messages(SOURCE_CHANNEL, ids=msg_id)
+            if msg:
+                await retry_queue.put((msg, attempt))
+                logging.info(f"Loaded persisted retry for message {msg_id}, attempt {attempt}")
+            else:
+                logging.warning(f"Could not find message {msg_id} for retry")
+                await remove_persisted_retry(msg_id)
+        except Exception as e:
+            logging.error(f"Failed to load persisted retry for msg {msg_id}: {repr(e)}")
+            
+    retry_count = 0
+    max_retries_per_batch = 20
+    
+    while True:
+        try:
+            if retry_count >= max_retries_per_batch:
+                logging.info(f"Processed {retry_count} retries, pausing retry queue")
+                break
+                
+            msg, attempt = await asyncio.wait_for(retry_queue.get(), timeout=10)
+            retry_count += 1
+            
+            jitter = random.uniform(0.5, 2.0)
+            await asyncio.sleep(MESSAGE_DELAY * jitter)
+            
+            success = await attempt_forward_message(msg, attempt)
+            if success:
+                logging.info(f"Retry succeeded for message {msg.id}, attempt {attempt}")
+            else:
+                logging.warning(f"Retry failed for message {msg.id}, attempt {attempt}")
+                
+            retry_queue.task_done()
+            
+        except asyncio.TimeoutError:
+            logging.info("No more retries in queue")
+            break
+        except Exception as e:
+            logging.error(f"Error processing retry queue: {repr(e)}")
+            await asyncio.sleep(5)
+    
+    remaining = retry_queue.qsize()
+    if remaining > 0:
+        logging.info(f"Still {remaining} items in retry queue for next batch")
+
+# =============================================================================
+# 📌 Section 18: Backlog Processing with Sequential Message Forwarding
+# =============================================================================
+
+async def process_message_chunk(messages):
+    """Process messages in sequential order by ID."""
+    # First sort messages by ID to ensure sequential processing
+    messages.sort(key=lambda m: m.id)
+    
+    semaphore = asyncio.Semaphore(1)  # Limit to 1 concurrent task for strict sequential processing
+    success_count = 0
+    
+    # Process one message at a time
+    for msg in messages:
+        async with semaphore:
+            try:
+                result = await attempt_forward_message(msg)
+                if result is True:
+                    success_count += 1
+            except Exception as e:
+                logging.error(f"Error in message processing: {repr(e)}")
+    
+    return success_count
+
+async def process_backlog():
+    last_id = await get_last_forwarded_message()
+    logging.info(f"Processing backlog from {last_id + 1} to {END_MESSAGE}")
+    
+    count = 0
+    async for _ in user_client.iter_messages(
+        SOURCE_CHANNEL,
+        min_id=last_id + 1,
+        max_id=END_MESSAGE,
+        limit=1
+    ):
+        count += 1
+    
+    if count == 0:
+        logging.info("No new messages to forward")
+        print("\n")
+        print("=" * 50)
+        print("               FINAL REPORT               ")
+        print("=" * 50)
+        print(f"✅ Forwarded Messages: {MESSAGE_SUCCESS_COUNT}")
+        print(f"⚠️ Skipped Messages: {len(SKIPPED_MESSAGES)}")
+        print(f"❌ Failed Messages: {len(FAILED_MESSAGES)}")
+        print("\nSkipped Message Details: None")
+        print("\nFailed Message IDs: None")
+        print("=" * 50)
+        print("          BOT EXECUTION COMPLETED          ")
+        print("=" * 50)
+        
+        # Set stop event to trigger proper shutdown
+        STOP_EVENT.set()
+        
+        # Schedule graceful exit via event loop
+        loop = asyncio.get_event_loop()
+        loop.call_later(1, sys.exit, 0)
+        return
+    
+    logging.info(f"Found approximately {count} messages to process")
+    
+    # Get messages and sort by ID
+    messages_list = []
+    async for msg in user_client.iter_messages(
+        SOURCE_CHANNEL,
+        min_id=last_id + 1,
+        max_id=END_MESSAGE,
+        reverse=True  # This ensures oldest messages first
+    ):
+        if STOP_EVENT.is_set():
+            logging.info("Stop event detected during backlog processing")
+            break
+        
+        if not await is_message_forwarded(msg.id):
+            messages_list.append(msg)
+    
+    # Sort all messages by ID to ensure sequential processing
+    messages_list.sort(key=lambda m: m.id)
+    logging.info(f"Collected {len(messages_list)} messages to process in sequential order")
+    
+    # Process in chunks for progress reporting
+    processed = 0
+    chunk_size = BATCH_SIZE
+    for i in range(0, len(messages_list), chunk_size):
+        if STOP_EVENT.is_set():
+            break
+            
+        current_chunk = messages_list[i:i+chunk_size]
+        success_count = await process_message_chunk(current_chunk)
+        processed += len(current_chunk)
+        
+        if processed % (chunk_size * 5) == 0:
+            progress = (processed / count) * 100 if count > 0 else 0
+            logging.info(f"Progress: {processed}/{count} messages ({progress:.1f}%)")
+            await send_alert(f"Progress update: {processed}/{count} messages ({progress:.1f}%)")
+            
+        # Process retries between chunks
+        if processed % (chunk_size * 10) == 0:
+            await process_retry_queue()
+    
+    await process_retry_queue()
+    await send_report()
+    
+    with Database(DB_FILE) as db:
+        final_count = await asyncio.to_thread(lambda: db.cursor.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
+        logging.info(f"Final number of forwarded messages in DB: {final_count}")
+    
+    await retry_failed_messages()
+    
+    # Prepare final report
+    print("\n")
+    print("=" * 50)
+    print("               FINAL REPORT               ")
+    print("=" * 50)
+    print(f"✅ Forwarded Messages: {MESSAGE_SUCCESS_COUNT}")
+    print(f"⚠️ Skipped Messages: {len(SKIPPED_MESSAGES)}")
+    print(f"❌ Failed Messages: {len(FAILED_MESSAGES)}")
+    print("\nSkipped Message Details:")
+    
+    # Print skipped message details
+    if SKIPPED_MESSAGES:
+        for idx, (msg_id, reason) in enumerate(SKIPPED_MESSAGES[:10]):
+            print(f"  • Message {msg_id}: {reason}")
+        if len(SKIPPED_MESSAGES) > 10:
+            print(f"  • ... and {len(SKIPPED_MESSAGES) - 10} more")
+    else:
+        print("  None")
+    
+    print("\nFailed Message IDs:")
+    if FAILED_MESSAGES:
+        for idx, (msg_id, _) in enumerate(FAILED_MESSAGES[:10]):
+            print(f"  • Message {msg_id}")
+        if len(FAILED_MESSAGES) > 10:
+            print(f"  • ... and {len(FAILED_MESSAGES) - 10} more")
+    else:
+        print("  None")
+    
+    print("=" * 50)
+    print("          BOT EXECUTION COMPLETED          ")
+    print("=" * 50)
+    
+    # Set stop event to trigger proper shutdown
+    STOP_EVENT.set()
+    
+    # Cancel all tasks except the current one for proper cleanup
+    current_task = asyncio.current_task()
+    for task in asyncio.all_tasks():
+        if task is not current_task and not task.done():
+            task.cancel()
+    
+    # Schedule graceful exit via event loop
+    loop = asyncio.get_event_loop()
+    loop.call_later(1, sys.exit, 0)  # Use sys.exit instead of os._exit for graceful exit
+
+# =============================================================================
+# 📌 Section 19: Reporting & Notification Functions
+# =============================================================================
+
+async def send_report():
+    skipped_details = "\n".join([f"ID: {mid}, Reason: {reason}" for mid, reason in SKIPPED_MESSAGES[:50]])
+    if len(SKIPPED_MESSAGES) > 50:
+        skipped_details += f"\n... and {len(SKIPPED_MESSAGES) - 50} more"
+        
+    report = (
+        f"<b>Report Summary</b>\n"
+        f"Forwarded Messages: {MESSAGE_SUCCESS_COUNT}\n"
+        f"Skipped Messages: {len(SKIPPED_MESSAGES)}\n"
+        f"Failed Messages: {len(FAILED_MESSAGES)}\n"
+        f"<b>Skipped Details:</b>\n{skipped_details}\n"
+        "For detailed info, please refer to the log file."
+    )
+    try:
+        await bot_client.send_message(ADMIN_CHAT_ID, report, parse_mode="html")
+    except Exception as e:
+        if "too long" in str(e).lower():
+            simple_report = (
+                f"<b>Report Summary</b>\n"
+                f"Forwarded Messages: {MESSAGE_SUCCESS_COUNT}\n"
+                f"Skipped Messages: {len(SKIPPED_MESSAGES)}\n"
+                f"Failed Messages: {len(FAILED_MESSAGES)}\n"
+                f"See logs for details."
+            )
+            try:
+                await bot_client.send_message(ADMIN_CHAT_ID, simple_report, parse_mode="html")
+            except Exception as e2:
+                logging.error(f"Failed to send simplified report: {repr(e2)}")
+        else:
+            logging.error(f"Failed to send report: {repr(e)}")
+    
+    logging.info(f"Report summary: {MESSAGE_SUCCESS_COUNT} forwarded, {len(SKIPPED_MESSAGES)} skipped, {len(FAILED_MESSAGES)} failed")
+    print("Report sent to admin.")
+
+# =============================================================================
+# 📌 Section 20: Extra Reattempt for Failed Messages
+# =============================================================================
+
+async def retry_failed_messages():
+    if not FAILED_MESSAGES:
+        return
+    logging.info(f"Reattempting {len(FAILED_MESSAGES)} failed messages (extra {MAX_RETRIES} retries each)")
+    
+    sorted_failed = sorted(FAILED_MESSAGES.copy(), key=lambda item: get_message_priority(item[1]))
+    
+    for msg_id, original_msg in sorted_failed:
+        success = False
+        for extra_attempt in range(1, MAX_RETRIES + 1):
+            logging.info(f"Extra reattempt {extra_attempt} for message {msg_id}")
+            try:
+                msg = await user_client.get_messages(SOURCE_CHANNEL, ids=msg_id)
+                if not msg:
+                    logging.warning(f"Could not find message {msg_id} for extra retry")
+                    continue
+            except Exception as e:
+                logging.error(f"Failed to fetch msg {msg_id} for reattempt: {repr(e)}")
+                await asyncio.sleep(5)
+                continue
+                
+            if await attempt_forward_message(msg, attempt=extra_attempt, reattempt=True):
+                success = True
+                logging.info(f"Message {msg_id} successfully forwarded on extra reattempt {extra_attempt}")
+                break
+                
+            retry_delay = min(30, extra_attempt * 5)
+            await asyncio.sleep(retry_delay)
+            
+        if not success:
+            try:
+                placeholder = f"Message {msg_id} permanently failed after extra reattempts! Contact @mylearninglistbot"
+                await user_client.send_message(DEST_CHANNEL, placeholder, parse_mode="html")
+                logging.error(f"Message {msg_id} permanently failed after extra reattempts. Placeholder sent.")
+            except Exception as e_placeholder:
+                logging.error(f"Failed to send placeholder for msg {msg_id} after extra reattempts: {repr(e_placeholder)}")
+    
+    FAILED_MESSAGES.clear()
+    logging.info("Finished processing failed messages")
+
+# =============================================================================
+# 📌 Section 21: Graceful Shutdown & Cleanup
+# =============================================================================
+
+async def shutdown():
+    logging.info("Starting graceful shutdown sequence")
+    # Cancel all tasks except current
+    for task in asyncio.all_tasks():
+        if task is not asyncio.current_task():
+            try:
+                task.cancel()
+            except:
+                pass
+            
+    skipped_details = "\n".join([f"ID: {mid}, Reason: {reason}" for mid, reason in SKIPPED_MESSAGES[:20]])
+    if len(SKIPPED_MESSAGES) > 20:
+        skipped_details += f"\n... and {len(SKIPPED_MESSAGES) - 20} more"
+        
+    final_report = (
+        f"<b>Final Report</b>\n"
+        f"Forwarded Messages: {MESSAGE_SUCCESS_COUNT}\n"
+        f"Skipped Messages: {len(SKIPPED_MESSAGES)}\n"
+        f"Failed Messages: {len(FAILED_MESSAGES)}\n"
+        f"<b>Skipped Sample:</b>\n{skipped_details}\n"
+        "Bot shutting down gracefully."
+    )
+    
+    try:
+        if bot_client.is_connected() and ADMIN_CHAT_ID:
+            await bot_client.send_message(ADMIN_CHAT_ID, final_report, parse_mode="html")
+            logging.info("Final report sent to admin")
+    except Exception as e:
+        logging.error(f"Failed to send final report: {repr(e)}")
+        
+    logging.info(final_report)
+    
+    try:
+        db_pool.close_all()
+        logging.info("Database connections closed")
+    except Exception as e:
+        logging.error(f"Error closing database connections: {repr(e)}")
+    
+    try:
+        if user_client.is_connected():
+            await user_client.disconnect()
+            logging.info("User client disconnected")
+    except Exception as e:
+        logging.error(f"Error disconnecting user client: {repr(e)}")
+        
+    try:
+        if bot_client.is_connected():
+            await bot_client.disconnect()
+            logging.info("Bot client disconnected")
+    except Exception as e:
+        logging.error(f"Error disconnecting bot client: {repr(e)}")
+        
+    logging.info("Clean shutdown completed")
+
+# =============================================================================
+# 📌 Section 22: Health Check & Main Execution Flow
+# =============================================================================
+
+async def health_check():
+    last_report_time = time.time()
+    report_interval = 3600  # Detailed report every hour
+    
+    while not STOP_EVENT.is_set():
+        try:
+            current_time = time.time()
+            if current_time - last_report_time < report_interval:
+                await user_client.send_message(ADMIN_CHAT_ID, "Health Check: System operational", parse_mode="html")
+            else:
+                last_report_time = current_time
+                memory = psutil.virtual_memory()
+                disk = psutil.disk_usage('/')
+                with Database(DB_FILE) as db:
+                    total_msgs = await asyncio.to_thread(
+                        lambda: db.cursor.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+                    )
+                    recent_msgs = await asyncio.to_thread(
+                        lambda: db.cursor.execute(
+                            "SELECT COUNT(*) FROM messages WHERE forwarded_at > datetime('now', '-1 hour')"
+                        ).fetchone()[0]
+                    )
+                report = (
+                    "📊 **System Health Report** 📊\n\n"
+                    f"**Bot Status**: {'ACTIVE ▶' if not BOT_PAUSED else 'PAUSED ⏸'}\n"
+                    f"**Messages Processed**: {MESSAGE_SUCCESS_COUNT}\n"
+                    f"**Messages in Last Hour**: {recent_msgs}\n"
+                    f"**Total in Database**: {total_msgs}\n"
+                    f"**Current Delay**: {MESSAGE_DELAY:.2f}s\n"
+                    f"**Batch Size**: {BATCH_SIZE}\n\n"
+                    f"**System Memory**: {memory.percent}% used\n"
+                    f"**Disk Space**: {disk.percent}% used\n"
+                    f"**Flood Wait Count**: {FLOOD_WAIT_COUNT}\n"
+                    f"**Failed Messages**: {len(FAILED_MESSAGES)}\n"
+                )
+                await user_client.send_message(ADMIN_CHAT_ID, report, parse_mode="markdown")
+        except Exception as e:
+            logging.error(f"Health check failed: {repr(e)}")
+        
+        check_interval = 300
+        if FLOOD_WAIT_COUNT > 5 or len(FAILED_MESSAGES) > 10:
+            check_interval = 120
+        await asyncio.sleep(check_interval)
+
+# =============================================================================
+# 📌 Section 23: Main Execution with Database Initialization
+# =============================================================================
+
+async def main():
+    # Debug configuration at startup
+    logging.info("==== Configuration Debug ====")
+    logging.info(f"API_ID: {API_ID}")
+    logging.info(f"SOURCE_CHANNEL: {SOURCE_CHANNEL}, DEST_CHANNEL: {DEST_CHANNEL}")
+    logging.info(f"Message range: {START_MESSAGE} to {END_MESSAGE}")
+    logging.info(f"USE_ORIGINAL_CAPTIONS: {config.get('USE_ORIGINAL_CAPTIONS')}, type: {type(config.get('USE_ORIGINAL_CAPTIONS'))}")
+    logging.info(f"USE_FILENAME_AS_CAPTION: {config.get('USE_FILENAME_AS_CAPTION')}, type: {type(config.get('USE_FILENAME_AS_CAPTION'))}")
+    logging.info(f"APPLY_CUSTOM_CAPTION: {config.get('APPLY_CUSTOM_CAPTION')}, type: {type(config.get('APPLY_CUSTOM_CAPTION'))}")
+    logging.info(f"CLICKABLE_BASE_CAPTION: {config.get('CLICKABLE_BASE_CAPTION')}, type: {type(config.get('CLICKABLE_BASE_CAPTION'))}")
+    logging.info(f"ADD_VIDEO_DURATION: {config.get('ADD_VIDEO_DURATION')}, type: {type(config.get('ADD_VIDEO_DURATION'))}")
+    logging.info("============================")
+    
+    try:
+        logging.info("Starting Telegram message forwarding bot")
+        logging.info(f"API ID: {API_ID}, Source Channel: {SOURCE_CHANNEL}, Destination Channel: {DEST_CHANNEL}")
+        
+        # Initialize database
+        setup_database()
+        
+        # Start the clients
+        try:
+            await user_client.start(PHONE_NUMBER)
+            logging.info("User client started successfully")
+        except Exception as e:
+            logging.error(f"User client startup failed: {repr(e)}")
+            sys.exit(1)
+            
+        try:
+            await bot_client.start(bot_token=BOT_TOKEN)
+            logging.info("Bot client started successfully")
+        except Exception as e:
+            logging.error(f"Bot client startup failed: {repr(e)}")
+            sys.exit(1)
+        
+        try:
+            await bot_client.send_message(
+                ADMIN_CHAT_ID, 
+                f"🤖 Bot started successfully\n"
+                f"Source Channel: {SOURCE_CHANNEL}\n"
+                f"Destination Channel: {DEST_CHANNEL}\n"
+                f"Message Range: {START_MESSAGE} to {END_MESSAGE}",
+                parse_mode="html"
+            )
+        except Exception as e:
+            logging.error(f"Failed to send startup notification: {repr(e)}")
+        
+        # Set a watchdog timer for global script timeout
+        asyncio.get_event_loop().call_later(3600, lambda: sys.exit(0))  # 1 hour max runtime
+        
+        # Process messages
+        health_task = asyncio.create_task(health_check())
+        await process_backlog()  # This now includes result reporting and proper exit
+        
+        # We only get here if process_backlog didn't exit
+        if not STOP_EVENT.is_set():
+            STOP_EVENT.set()
+        
+        health_task.cancel()
+        await shutdown()
+        
+        # Extra safety - exit if we somehow get here
+        sys.exit(0)
+        
+    except Exception as e:
+        logging.critical(f"Unhandled exception in main: {repr(e)}\n{traceback.format_exc()}")
+        await send_alert(f"Critical error: {repr(e)[:500]}")
+        await shutdown()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("User initiated shutdown via KeyboardInterrupt")
+        print("KeyboardInterrupt received, shutting down...")
+        sys.exit(0)
+    except Exception as e:
+        logging.critical(f"Critical failure in main thread: {repr(e)}\n{traceback.format_exc()}")
+        sys.exit(1)
